@@ -18,3 +18,24 @@ runs/
 
 # === Python 编译缓存 ===
 __pycache__/
+
+# === 实验中间产物（调参/A-B 测试时产生，非交付内容） ===
+out_*/
+output_nocopy/
+output_nocopy_1M/
+output_SDST_nocopy_1M/
+output_timecheck/
+tmp_one_*/
+
+# === 算例临时子集（从 instance/ 切出的快速验证集，按需重建） ===
+instance_check5/
+instance_first27/
+instance_gap1/
+instance_quick/
+instance_repr/
+
+# === 诊断用临时 CSV / 备份二进制 ===
+check5_*.csv
+runs_check5_*.csv
+tabu_search_results.csv
+backup/

@@ -11,6 +11,7 @@
 #include "Instance.h"
 #include "Random.h"
 #include "Solver.h"
+#include "Config.h"
 
 namespace
 {
@@ -34,6 +35,11 @@ namespace
                   << "  --init N   初始解构造次数（取最优），默认 " << kDefaultInitAttempts << "\n"
                   << "  --inst DIR 算例目录，默认 " << kDefaultInstanceDir << "\n"
                   << "  --out  DIR 调度表输出目录，默认 " << kDefaultOutputDir << "\n"
+                  << "\n实验开关（用于 A/B 与回退）：\n"
+                  << "  --no-fast-probe   关闭 P1 探针正向-only 评估，改回完整 update_time()\n"
+                  << "  --no-adaptive-topk  关闭 P11 动态 top-K，固定为 8\n"
+                  << "  --topk-max N      P11 打平时 K 的上限，默认 32\n"
+                  << "  --idx-offset N    算例序号偏移；分片并行跑时用于还原全局序号，保证种子不变。默认 0\n"
                   << "示例: " << program << " --inst ../instance_SDST --out ../output_SDST\n";
     }
 
@@ -55,6 +61,10 @@ int main(int argc, char* argv[]) {
     int init_attempts = kDefaultInitAttempts;
     std::string instance_dir = kDefaultInstanceDir;
     std::string output_dir = kDefaultOutputDir;
+    // 算例序号偏移：把算例集切成若干分片并行跑时，用它在每个分片内还原算例的
+    // 「全局序号」，从而拿到与串行跑完全相同的种子（见 main.cpp 中 derive_seed 的调用）。
+    // 默认 0，即序号就是本目录内的排序位置，行为与原先一致。
+    int idx_offset = 0;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -78,6 +88,20 @@ int main(int argc, char* argv[]) {
                 instance_dir = next_value("--inst");
             } else if (arg == "--out") {
                 output_dir = next_value("--out");
+            } else if (arg == "--no-fast-probe") {
+                cfg::fast_probe = false; // P1 回退：探针改回完整 update_time()
+            } else if (arg == "--no-adaptive-topk") {
+                cfg::adaptive_topk = false; // P11 回退：top-K 固定为 8
+            } else if (arg == "--topk-max") {
+                cfg::topk_max = std::stoi(next_value("--topk-max")); // P11 打平时 K 的上限
+            } else if (arg == "--idx-offset") {
+                idx_offset = std::stoi(next_value("--idx-offset")); // 分片并行时还原全局算例序号
+            } else if (arg == "--lahc") {
+                cfg::lahc = true; // C1：开启 LAHC 滑动窗口接受准则
+            } else if (arg == "--lahc-H") {
+                cfg::lahc_H = std::stoi(next_value("--lahc-H")); // C1：窗口长度 H
+            } else if (arg == "--adaptive-perturb") {
+                cfg::adaptive_perturb = true; // C3：开启 ILS 自适应扰动强度
             } else if (arg == "--help" || arg == "-h") {
                 print_usage(argv[0]);
                 return 0;
@@ -135,6 +159,7 @@ int main(int argc, char* argv[]) {
         std::cout << "迭代上限: " << max_iterations << "    时间上限: " << time_limit
                   << " s/算例    随机种子: " << seed << std::endl;
         std::cout << "重启次数: " << restarts << "    初始解构造次数: " << init_attempts << std::endl;
+        std::cout << "实验开关: " << cfg::summary() << std::endl;
         std::cout << "待求解算例数: " << instance_files.size() << std::endl;
 
         for (std::size_t idx = 0; idx < instance_files.size(); ++idx) {
@@ -144,11 +169,15 @@ int main(int argc, char* argv[]) {
 
             std::cout << "\n[正在求解] " << short_name << "..." << std::endl;
 
+            // 全局序号 = 本目录内的排序位置 + 分片偏移。
+            // 这样把算例集切成多片并行跑时，每个算例仍拿到与整批串行跑完全相同的种子。
+            const std::size_t global_idx = idx + static_cast<std::size_t>(idx_offset);
+
             try {
                 // 0. 为当前算例重新播种。
                 //    若不重置，算例会共用同一条随机流，其初始解取决于前面算例消耗了多少
                 //    随机数 —— 增删算例或改动迭代次数都会让它变化，实验无法逐例复现。
-                const std::uint32_t instance_seed = derive_seed(seed, idx, 0);
+                const std::uint32_t instance_seed = derive_seed(seed, global_idx, 0);
 
                 // 1. 加载算例
                 Instance instance(filename.c_str());
@@ -161,7 +190,7 @@ int main(int argc, char* argv[]) {
                 //    每次重启都重新播种，保证 restart k 的结果与 k 的取值无关。
                 SolveResult result;
                 for (int r = 0; r < restarts; ++r) {
-                    rng::reseed(derive_seed(seed, idx, r));
+                    rng::reseed(derive_seed(seed, global_idx, r));
                     if (restarts > 1) {
                         std::cout << "  [重启 " << (r + 1) << "/" << restarts << "]" << std::endl;
                     }

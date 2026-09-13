@@ -8,6 +8,8 @@
 #include <chrono>
 #include <set>
 
+#include "Config.h"
+
 NeighborhoodMove TabuSearch::find_move()
 {
     std::vector<NeighborhoodMove> all_moves;
@@ -21,6 +23,14 @@ NeighborhoodMove TabuSearch::find_move()
     // 2. 遍历每一个关键块，以及块内的每一个工序
     for (const auto& block : critical_blocks)
     {
+        // 【P8】邻域枚举本身就可能耗时很久。原先只能在每轮循环顶部查一次时钟，
+        // 单次 find_move 可达数百秒且无法打断（实测过冲 15 倍）。这里在每个关键块
+        // 之前再查一次，超时就放弃本轮，由 search() 跳出。
+        if (past_deadline()) {
+            timed_out_ = true;
+            return NeighborhoodMove();
+        }
+
         const int block_size = static_cast<int>(block.size());
 
         for (int idx = 0; idx < block_size; ++idx)
@@ -79,6 +89,12 @@ if (op_case == MoveCase::CASE_I || op_case == MoveCase::CASE_III)
 
     // 动作 Type 3：换机器向后移动 (CHANGE_MACHINE_BACK)
     for (int k_prime : (*current_schedule.operation_list)[u].candidates) {
+        // 【P8】柔性大的算例（如 dauzere c=10）候选机器很多，
+        // 每台机器还要枚举插入位置，这里是单次 find_move 内最热的循环。
+        if (past_deadline()) {
+            timed_out_ = true;
+            return NeighborhoodMove();
+        }
         if (k_prime != current_machine) {
             // 尝试插入到新机器的最前面 (where = -1)
             NeighborhoodMove move_change_back_first(Method::CHANGE_MACHINE_BACK, u, -1, k_prime);
@@ -118,6 +134,10 @@ if (op_case == MoveCase::CASE_II || op_case == MoveCase::CASE_III)
 
     // 动作 Type 4：换机器向前移动 (CHANGE_MACHINE_FRONT)
     for (int k_prime : (*current_schedule.operation_list)[u].candidates) {
+        if (past_deadline()) { // 【P8】同上
+            timed_out_ = true;
+            return NeighborhoodMove();
+        }
         if (k_prime != current_machine) {
             // 尝试插入到新机器的最后面 (where = -1)
             NeighborhoodMove move_change_front_last(Method::CHANGE_MACHINE_FRONT, u, -1, k_prime);
@@ -164,27 +184,59 @@ if (op_case == MoveCase::CASE_II || op_case == MoveCase::CASE_III)
     // ========================================================
     if (!lb_values_.empty() && lb_values_.size() == all_moves.size()) {
         constexpr int kPreciseTopK = 8;
-        std::vector<int> order(lb_values_.size());
+        // 【P6】复用成员缓冲区，消除每代一次 new/delete。
+        topk_order_.resize(lb_values_.size());
+        auto& order = topk_order_;
         for (size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
         std::sort(order.begin(), order.end(),
                   [this](int a, int b) { return lb_values_[a] < lb_values_[b]; });
 
+        // 【P11】动态 K：若 LB 最小值上打平的候选多于 K 个，说明 LB 已经
+        // 失去区分度，「取前 K 个」退化成随机采样，此时把 K 扩到覆盖全部
+        // 打平候选（受 topk_max 限制）。平局少时仍为 8，不额外付费。
+        int kPrecise = kPreciseTopK;
+        if (cfg::adaptive_topk && !order.empty()) {
+            const int best_lb = lb_values_[order[0]];
+            int ties = 0;
+            while (ties < static_cast<int>(order.size()) && lb_values_[order[ties]] == best_lb) {
+                ++ties;
+            }
+            if (ties > kPrecise) kPrecise = std::min(ties, cfg::topk_max);
+        }
+
         int best_real = INT_MAX;
         int best_idx = -1;
-        const int limit = std::min<int>(kPreciseTopK, static_cast<int>(order.size()));
+        const int limit = std::min<int>(kPrecise, static_cast<int>(order.size()));
         for (int i = 0; i < limit; ++i) {
             if (lb_values_[order[i]] == INT_MAX) break; // 后面的都是禁忌动作
-            Schedule probe = current_schedule;
+
+            // 复用探针对象，只覆盖图结构即可：
+            // time_info 会被 update_time() 全量重算，没必要跟着一起拷贝。
+            if (!probe_schedule_.operation_list) probe_schedule_ = current_schedule;
+            probe_schedule_.graph = current_schedule.graph;
             try {
-                probe.make_move(all_moves[order[i]]);
-                probe.update_time();
+                if (cfg::fast_probe) {
+                    // 【P1+P2+P4】探针只算正向，并把「当前已找到的最佳候选」作为
+                    // 提前中止的上界：一旦运行中的 makespan 超过它就没必要再算下去。
+                    // 返回的 makespan 与完整 update_time() 完全一致 → 搜索轨迹不变。
+                    const int real = probe_schedule_.apply_and_eval_makespan(
+                        all_moves[order[i]], best_real);
+                    if (real < best_real) {
+                        best_real = real;
+                        best_idx = order[i];
+                    }
+                } else {
+                    // 旧路径：Schedule::make_move 内部已调用 update_time()。
+                    // （原先这里又补了一次 update_time()，是纯重复的整图解码，已去掉。）
+                    probe_schedule_.make_move(all_moves[order[i]]);
+                    const int real = probe_schedule_.get_makespan();
+                    if (real < best_real) {
+                        best_real = real;
+                        best_idx = order[i];
+                    }
+                }
             } catch (...) {
                 continue; // 产生环等异常，跳过
-            }
-            const int real = probe.get_makespan();
-            if (real < best_real) {
-                best_real = real;
-                best_idx = order[i];
             }
         }
         if (best_idx >= 0) return all_moves[best_idx];
@@ -244,7 +296,7 @@ void TabuSearch::update_critical_block()
                 int m = graph.on_machine[op];
                 int prev_job = operation_list[op].job_id;
                 int next_job = operation_list[ms_op].job_id;
-                setup_time = instance->sdst_matrix[m][prev_job][next_job];
+                setup_time = instance->setup_flat(m, prev_job, next_job);
             }
             // ============================================
 
@@ -321,7 +373,7 @@ void TabuSearch::update_critical_block()
                             int m = graph.on_machine[prev_critical_op];
                             int prev_job = operation_list[prev_critical_op].job_id;
                             int next_job = operation_list[curr_machine_op].job_id;
-                            setup_time = instance->sdst_matrix[m][prev_job][next_job];
+                            setup_time = instance->setup_flat(m, prev_job, next_job);
                         }
                         // ============================================
 
@@ -440,7 +492,7 @@ void TabuSearch::same_machine_evaluate_and_push(const Schedule& schedule, const 
         r_prime_machine = schedule.time_info[PM].end_time;
         if (instance != nullptr) {
             int job_pm = (*schedule.operation_list)[PM].job_id;
-            r_prime_machine += instance->sdst_matrix[m][job_pm][job_u]; // 加上新产生的 Setup Time
+            r_prime_machine += instance->setup_flat(m, job_pm, job_u); // 加上新产生的 Setup Time
         }
     }
 
@@ -451,7 +503,7 @@ void TabuSearch::same_machine_evaluate_and_push(const Schedule& schedule, const 
         q_prime_machine = p_sm + schedule.time_info[SM].q_machine;
         if (instance != nullptr) {
             int job_sm = (*schedule.operation_list)[SM].job_id;
-            q_prime_machine += instance->sdst_matrix[m][job_u][job_sm]; // 加上新产生的 Setup Time
+            q_prime_machine += instance->setup_flat(m, job_u, job_sm); // 加上新产生的 Setup Time
         }
     }
 
@@ -505,7 +557,7 @@ void TabuSearch::change_machine_evaluate_and_push(const Schedule& schedule, cons
         r_prime_machine = schedule.time_info[PM].end_time;
         if (instance != nullptr) {
             int job_pm = (*schedule.operation_list)[PM].job_id;
-            r_prime_machine += instance->sdst_matrix[target_m][job_pm][job_u];
+            r_prime_machine += instance->setup_flat(target_m, job_pm, job_u);
         }
     }
 
@@ -516,7 +568,7 @@ void TabuSearch::change_machine_evaluate_and_push(const Schedule& schedule, cons
         q_prime_machine = p_sm + schedule.time_info[SM].q_machine;
         if (instance != nullptr) {
             int job_sm = (*schedule.operation_list)[SM].job_id;
-            q_prime_machine += instance->sdst_matrix[target_m][job_u][job_sm];
+            q_prime_machine += instance->setup_flat(target_m, job_u, job_sm);
         }
     }
 
@@ -705,13 +757,14 @@ bool TabuSearch::try_apply_move(const NeighborhoodMove& move)
     if (move.which <= 0 || move.where == move.which) return false;
     if (!current_schedule.is_legal_move(move)) return false;
 
-    // 只备份图结构：时间信息可由 update_time() 重新算出，无需整体复制
-    const Graph backup = current_schedule.graph;
+    // 只备份图结构：时间信息可由 update_time() 重新算出，无需整体复制。
+    // 复用 undo_graph_ 的容量，避免每调用一次就申请/释放 11 个 vector。
+    undo_graph_ = current_schedule.graph;
     try {
         current_schedule.make_move(move); // 内部执行 graph.make_move + update_time（含成环检测）
     }
     catch (const std::runtime_error&) {
-        current_schedule.graph = backup;
+        current_schedule.graph = undo_graph_;
         current_schedule.update_time();
         return false;
     }
@@ -852,6 +905,13 @@ void TabuSearch::search(const Schedule& schedule, const std::atomic<bool>& stop_
     current_schedule = schedule;
     best_schedule = schedule;
     iteration = 0;
+
+    // 预热可复用缓冲区：一次性把容量分配到位。
+    // 之后每一代只做 memcpy（vector 拷贝赋值复用容量），不再向堆申请内存。
+    backup_graph_ = schedule.graph;
+    undo_graph_ = schedule.graph;
+    probe_schedule_ = schedule;
+
     int non_improve_iter = 0;
     int continuous_no_move = 0;
     int perturb_since_improve = 0;   // 连续多少次扰动仍未刷新历史最优
@@ -866,29 +926,53 @@ void TabuSearch::search(const Schedule& schedule, const std::atomic<bool>& stop_
     timed_out_ = false;
     elapsed_seconds_ = 0.0;
 
+    // 【C1】LAHC 历史窗口初始化：全部填初始解 makespan
+    if (cfg::lahc) {
+        lahc_history_.assign(static_cast<size_t>(cfg::lahc_H), current_schedule.get_makespan());
+    }
+
     const auto start_time = std::chrono::steady_clock::now();
-    unsigned long long check_counter = 0;
+
+    // 【P8】把期限交给 find_move()，使它内部的邻域枚举也能被打断。
+    // 详见 TabuSearch.h 中 deadline_tp_ 的注释。
+    deadline_tp_ = start_time + std::chrono::duration_cast<Clock::duration>(
+                                    std::chrono::duration<double>(time_limit_seconds_));
 
     while (iteration < max_iterations_) {
-        // 每 64 轮检查一次终止条件，避免高频读取系统时钟拖慢搜索
-        if ((++check_counter & 63ULL) == 0)
-        {
-            if (stop_flag.load(std::memory_order_relaxed)) break;
+        // 终止条件检查：逐轮（细粒度）检查。
+        //
+        // 【修改说明】原实现每 64 轮才读一次时钟
+        //   if ((++check_counter & 63ULL) == 0) { ... }
+        // 当单轮 find_move/扰动较慢时（病态算例上可达秒级），会以
+        // "64 倍单轮耗时" 为粒度严重过冲——实测有算例跑满 940s 才停，
+        // 远超设定的 60s 上限，导致时间预算完全失控、且行为不可预期。
+        //
+        // steady_clock::now() 的开销约数十纳秒，相对单轮搜索（微秒~毫秒级）
+        // 完全可以忽略，因此逐轮检查不会拖慢搜索，却能把过冲从 64 轮压缩到 1 轮。
+        if (stop_flag.load(std::memory_order_relaxed)) break;
 
-            const double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - start_time).count();
-            if (elapsed >= time_limit_seconds_)
-            {
-                timed_out_ = true;
-                break;
-            }
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_time).count();
+        if (elapsed >= time_limit_seconds_)
+        {
+            timed_out_ = true;
+            break;
         }
 
         auto move = find_move();
 
+        // 【P8】find_move() 内部撞上期限：它会返回空移动并置 timed_out_。
+        // 这里直接跳出，避免再做一次无意义的扰动。
+        if (timed_out_) break;
+
         if (move.which <= 0) {
             continuous_no_move++;
-            apply_perturbation(1.0 + 0.15 * perturb_since_improve);
+            {
+                const double intensity = cfg::adaptive_perturb
+                    ? (1.0 + 0.06 * perturb_since_improve + 0.015 * perturb_since_improve * perturb_since_improve)
+                    : (1.0 + 0.15 * perturb_since_improve);
+                apply_perturbation(intensity);
+            }
             tabu_list.clear();
             perturb_since_improve++;
             if (perturb_since_improve >= kMaxPerturbNoImprove) {
@@ -906,9 +990,39 @@ void TabuSearch::search(const Schedule& schedule, const std::atomic<bool>& stop_
         continuous_no_move = 0;
 
         // ==========================================
-        // 【核心修改 1】：保存当前绝对安全的无环状态
+        // 【C1】LAHC 滑动窗口接受准则
+        //
+        // 应用移动前，先用前向探针估出候选 makespan，按「优于窗口历史 或 优于当前解」
+        // 接受，允许当前解暂时劣化以逃离吸引域（经典 LAHC, Burke et al. 2003）。
+        // 只改接受逻辑、不改邻域，风险低；让同一次迭代选得更值钱、同样预算达更多下界。
+        // 关闭 cfg::lahc 时退化为原「无条件应用 find_move 所选移动」的行为。
         // ==========================================
-        Schedule backup_schedule = current_schedule;
+        bool do_apply = true;
+        if (cfg::lahc) {
+            probe_schedule_ = current_schedule;                 // 重置探针为当前解
+            const int cand = probe_schedule_.apply_and_eval_makespan(move);
+            const unsigned long long k = iteration;
+            // 写入本代开始时的解（移动前），供 H 代之后的自己参考
+            lahc_history_[k % static_cast<unsigned long long>(cfg::lahc_H)] = current_schedule.get_makespan();
+            do_apply = (cand != INT_MAX) &&
+                       (cand <= lahc_history_[k % static_cast<unsigned long long>(cfg::lahc_H)] ||
+                        cand <  current_schedule.get_makespan());
+            if (!do_apply) {
+                ++iteration;                                   // 拒绝：仅推进迭代与窗口
+                continue;
+            }
+        }
+
+        // ==========================================
+        // 【核心修改 1】：保存当前绝对安全的无环状态
+        //
+        // 原先是 `Schedule backup_schedule = current_schedule;`，每代都要构造一个
+        // 完整 Schedule（Graph 的 11 个 vector + time_info），约 100 次堆分配。
+        // 现在只备份 Graph 并复用 backup_graph_ 的容量：成环异常由 update_time()
+        // 中的 topological_sort 抛出，而它在写入任何时间信息之前执行，因此
+        // time_info 与 makespan 此刻仍是移动前的原值，本来就不需要备份。
+        // ==========================================
+        backup_graph_ = current_schedule.graph;
 
         try {
             // 尝试执行物理移动并更新时间 (内部会触发拓扑排序检测环)
@@ -920,7 +1034,8 @@ void TabuSearch::search(const Schedule& schedule, const std::atomic<bool>& stop_
             // ==========================================
             // std::clog << "[拦截] 动作导致拓扑环，执行回退..." << std::endl;
 
-            current_schedule = backup_schedule; // 瞬间恢复所有图结构和时间指针
+            // 瞬间恢复图结构；time_info 与 makespan 本就未被改动，无需恢复
+            current_schedule.graph = backup_graph_;
 
             // 严厉惩罚这个导致死锁的动作，将其关入“永久禁忌黑名单”
             int v = -1;
@@ -949,7 +1064,12 @@ void TabuSearch::search(const Schedule& schedule, const std::atomic<bool>& stop_
 
         if (non_improve_iter >= max_non_improve) {
             // 扰动强度随连续无效扰动次数放大，帮助跳出深吸引域
-            apply_perturbation(1.0 + 0.15 * perturb_since_improve);
+            {
+                const double intensity = cfg::adaptive_perturb
+                    ? (1.0 + 0.06 * perturb_since_improve + 0.015 * perturb_since_improve * perturb_since_improve)
+                    : (1.0 + 0.15 * perturb_since_improve);
+                apply_perturbation(intensity);
+            }
             tabu_list.clear();
             non_improve_iter = 0;
             perturb_since_improve++;

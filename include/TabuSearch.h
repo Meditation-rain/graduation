@@ -5,6 +5,7 @@
 #ifndef TABUSEARCH_H
 #define TABUSEARCH_H
 #include <atomic>
+#include <chrono>
 #include <random>
 
 #include "Instance.h"
@@ -37,7 +38,20 @@ public:
                         double time_limit_seconds = 60.0) :
         // 【核心修改】：把 machine_num 换成图中所有的节点总数 + 1
         // (这里的 +1 是为了给原本前驱为 -1 的头部工序留一个特殊索引位置)
-        tabu_list(2000), // 如果你的 Instance 里没有 total_op_num，请替换为你图中实际的 node_num
+        // 【P7】按算例实际节点数定容。原先硬编码 2000 → 2000×2000×8B ≈ 32MB，
+        // 而最大算例的 node_num 仅约 300，浪费 44 倍；且每次扰动的 clear()
+        // 都要 memset 整整 32MB。TabuList 的读写都有边界检查，容量缩小后
+        // 对合法节点 ID 的行为完全一致，因此不影响搜索轨迹。
+        // 【P7】按算例实际规模定容。原先硬编码 2000 → 2000×2000×8B ≈ 32MB，
+        // 而最大算例的 node_num 仅约 300，浪费 44 倍；且每次扰动的 clear()
+        // 都要 memset 整整 32MB。内存降到约 0.7MB，对缓存也更友好。
+        //
+        // ⚠️ 容量必须是 node_num + 1，不能只用 node_num：
+        // make_move / is_tabu 用「id == node_num」表示「虚拟起点」这一路
+        // （见 TabuSearch.cpp 中 v == -1 时的映射），所以最大合法下标是 node_num。
+        // 若只按 node_num 定容，这类「移到机器最前面」的禁忌会被边界检查
+        // 静默丢弃，搜索轨迹随之改变——这一点在实测中已确认。
+        tabu_list(instance.op_num + 3), // node_num + 1 == (op_num + 2) + 1
         L(10 + instance.job_num / instance.machine_num),
         L_max(instance.job_num <= 2 * instance.machine_num ? static_cast<int>(L * 1.4) : static_cast<int>(L * 1.5)),
         time_limit_seconds_(time_limit_seconds),
@@ -66,6 +80,40 @@ private:
     /// 供「LB top-K 完整解码」阶段排序使用。
     mutable std::vector<int> lb_values_;
 
+    /// 【P6】top-K 排序用的下标缓冲，复用以避免每代一次堆分配。
+    /// 注意：这里仍用 std::sort 全排序而非 partial_sort —— partial_sort 对
+    /// LB 值相同的候选项会给出不同的排列顺序，会改变搜索轨迹。
+    /// 只在确认「改成 partial_sort 后质量不下降」时才可替换（届时需另做 A/B）。
+    std::vector<int> topk_order_;
+
+    // ==================================================================
+    // 【性能】可复用缓冲区：消除每代上百次堆分配
+    //
+    // 原实现每一代都要构造 1 个 Schedule 回滚备份 + 最多 K(8) 个 Schedule 探针，
+    // 每个 Schedule 含 Graph 的 11 个 vector 与 time_info，合计约 100 次 new/delete。
+    // 30 万代就是约 3000 万次堆分配 —— 这正是堆碎片化、单代耗时随运行时间
+    // 暴涨（实测最高 76 倍）的根因，也让「时间上限在哪一代截断」变得不可复现。
+    //
+    // 改为复用成员后，vector 的拷贝赋值会直接复用已有容量，稳态下零分配。
+    // ==================================================================
+
+    /// 回滚缓冲：只快照图结构即可。
+    /// 理由：成环异常由 update_time() 中的 topological_sort 抛出，而它在写入
+    /// 任何时间信息之前执行，因此 time_info 与 makespan 在异常时仍保持移动前
+    /// 的原值，无需备份。
+    Graph backup_graph_;
+
+    /// 扰动算子 try_apply_move 的回滚缓冲（与 backup_graph_ 分开，避免嵌套调用互相覆盖）
+    Graph undo_graph_;
+
+    /// top-K 精确评估的探针调度。只覆盖 graph，time_info 由 update_time() 全量重算。
+    Schedule probe_schedule_;
+
+    /// 【C1】LAHC 历史 cost 窗口：长度为 cfg::lahc_H，循环覆盖。
+    /// 每代把"本代开始时的解 cost"写入 history[iteration % H]，
+    /// 接受准则参考该槽位在 H 代之前记录的历史解。仅在 cfg::lahc 开启时使用。
+    std::vector<int> lahc_history_;
+
     double time_limit_seconds_;
     unsigned long long max_iterations_;
     bool timed_out_{false};
@@ -81,6 +129,27 @@ private:
     [[nodiscard]] bool is_tabu(const NeighborhoodMove& move, int makespan) const;
     void update_critical_block();
     void update_all_critical_block();
+
+    // ==================================================================
+    // 【P8】find_move 内部的期限（deadline）检查
+    //
+    // 原先只在 search() 每轮循环顶部查一次时钟，而真正耗时的部分在 find_move()
+    // 内部（邻域枚举 + top-K 精确解码），单次调用在病态算例上可达数百秒且无法打断。
+    // 实测 la22_vdata 在设定 60s 上限的情况下跑了 **926 秒**（过冲 15 倍），
+    // 既浪费预算，也让结果依赖机器负载而不可复现。
+    //
+    // deadline_tp_ 由 search() 设为「起始时刻 + 时间上限」；find_move() 在关键块
+    // 循环与候选机器循环里周期性地查它，超时则放弃本轮、置 timed_out_ 并返回空移动，
+    // search() 据此跳出。默认值为 time_point::max()，避免未设置时误判为超时。
+    // ==================================================================
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point deadline_tp_ = Clock::time_point::max();
+
+    /// 是否已超过本轮的时间期限
+    [[nodiscard]] bool past_deadline() const
+    {
+        return Clock::now() >= deadline_tp_;
+    }
 
     /**
      * @brief 混合扰动：换机器 + 同机器重插 + 同机器交换。

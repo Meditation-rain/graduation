@@ -146,7 +146,6 @@ void Graph::random_init(const Instance& instance, const OperationList& operation
     this->machine_operation_count.assign(machine_num, 0);
 
     on_machine.resize(this->node_num, -1);
-    on_machine_pos_vec.resize(this->node_num, 0);
 
     // 建立工件边
     for (int job_id = 0, op_id = 1; job_id < job_num; ++job_id)
@@ -199,8 +198,6 @@ void Graph::random_init(const Instance& instance, const OperationList& operation
         {
             first_machine_operation[curr_machine] = curr_op;
             last_machine_operation[curr_machine] = curr_op;
-            // 设置on_machine_pos = 0
-            on_machine_pos_vec[curr_op] = 0;
         }
         else
         {
@@ -208,8 +205,6 @@ void Graph::random_init(const Instance& instance, const OperationList& operation
             last_machine_operation[curr_machine] = curr_op;
             machine_successor[pre_machine_op] = curr_op;
             machine_predecessor[curr_op] = pre_machine_op;
-            // 设置on_machine_pos为当前机器操作数量减一（从0开始）
-            on_machine_pos_vec[curr_op] = machine_operation_count[curr_machine] - 1;
         }
         // 如果当前操作是工件的最后一个工序,将其从候选操作队列中移除
         if (job_successor[curr_op] == this->node_num - 1)
@@ -250,22 +245,11 @@ void Graph::make_move(const NeighborhoodMove& move)
         {
             u_insert = move.where;
             v_insert = (u_insert != -1) ? machine_successor[u_insert] : first_machine_operation[new_machine];
-            on_machine_pos_vec[move.which] = (u_insert != -1) ? on_machine_pos_vec[u_insert] + 1 : 0;
         }
         else // CHANGE_MACHINE_FRONT
         {
             v_insert = move.where;
             u_insert = (v_insert != -1) ? machine_predecessor[v_insert] : last_machine_operation[new_machine];
-            on_machine_pos_vec[move.which] = (v_insert != -1) ? on_machine_pos_vec[v_insert] : 0;
-        }
-
-        // 修改旧机器上的后续工序位置 (减1)
-        for (auto op = machine_successor[move.which]; op != -1; op = machine_successor[op]) {
-            on_machine_pos_vec[op]--;
-        }
-        // 修改新机器上的后续工序位置 (加1)
-        for (auto op = v_insert; op != -1; op = machine_successor[op]) {
-            on_machine_pos_vec[op]++;
         }
 
         on_machine[move.which] = new_machine;
@@ -302,22 +286,6 @@ void Graph::make_move(const NeighborhoodMove& move)
     // 获取当前被移动工序 u 的相邻节点
     const int ms_u = this->machine_successor[u];
     const int mp_u = this->machine_predecessor[u];
-
-    // 更新相对位置 pos_vec (这部分逻辑保持不变)
-    if (move.method == Method::FRONT)
-    {
-        on_machine_pos_vec[u] = on_machine_pos_vec[move.where];
-        for (auto op = move.where; op != u; op = this->machine_successor[op]) {
-            on_machine_pos_vec[op]++;
-        }
-    }
-    else if (move.method == Method::BACK)
-    {
-        on_machine_pos_vec[u] = on_machine_pos_vec[move.where];
-        for (auto op = move.where; op != u; op = this->machine_predecessor[op]) {
-            on_machine_pos_vec[op]--;
-        }
-    }
 
     // 【安全摘除】：将 u 从原来的位置干净地取出来，自动缝合两端
     if (mp_u != -1) this->machine_successor[mp_u] = ms_u;
@@ -417,7 +385,6 @@ int Graph::calculate_makespan_with_sdst(const OperationList& op_list) const {
 //     this->machine_operation_count.assign(machine_num, 0);
 //
 //     on_machine.resize(this->node_num, -1);
-//     on_machine_pos_vec.resize(this->node_num, 0);
 //
 //     // 用于贪心计算的可用时间跟踪数组
 //     std::vector<int> machine_avail_time(machine_num, 0);
@@ -501,7 +468,6 @@ int Graph::calculate_makespan_with_sdst(const OperationList& op_list) const {
 //         {
 //             first_machine_operation[curr_machine] = curr_op;
 //             last_machine_operation[curr_machine] = curr_op;
-//             on_machine_pos_vec[curr_op] = 0;
 //         }
 //         else
 //         {
@@ -509,7 +475,6 @@ int Graph::calculate_makespan_with_sdst(const OperationList& op_list) const {
 //             last_machine_operation[curr_machine] = curr_op;
 //             machine_successor[pre_machine_op] = curr_op;
 //             machine_predecessor[curr_op] = pre_machine_op;
-//             on_machine_pos_vec[curr_op] = machine_operation_count[curr_machine] - 1;
 //         }
 //
 //         // 6. 推进工序进度
@@ -543,7 +508,6 @@ void Graph::heuristic_init(const Instance& instance, const OperationList& operat
     this->machine_operation_count.assign(machine_num, 0);
 
     on_machine.resize(this->node_num, -1);
-    on_machine_pos_vec.resize(this->node_num, 0);
 
     std::vector<int> machine_avail_time(machine_num, 0);
     std::vector<int> node_avail_time(this->node_num, 0);
@@ -681,13 +645,11 @@ void Graph::heuristic_init(const Instance& instance, const OperationList& operat
         if (first_machine_operation[curr_machine] == -1) {
             first_machine_operation[curr_machine] = curr_op;
             last_machine_operation[curr_machine] = curr_op;
-            on_machine_pos_vec[curr_op] = 0;
         } else {
             int pre_machine_op = last_machine_operation[curr_machine];
             last_machine_operation[curr_machine] = curr_op;
             machine_successor[pre_machine_op] = curr_op;
             machine_predecessor[curr_op] = pre_machine_op;
-            on_machine_pos_vec[curr_op] = machine_operation_count[curr_machine] - 1;
         }
 
         if (job_successor[curr_op] == this->node_num - 1) {

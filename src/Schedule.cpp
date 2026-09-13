@@ -46,7 +46,7 @@ void Schedule::update_time()
                 int m = graph.on_machine[curr_node];
                 int curr_job = (*operation_list)[curr_node].job_id;
                 int prev_job = (*operation_list)[prev_machine_id].job_id;
-                machine_ready_time += instance->sdst_matrix[m][prev_job][curr_job];
+                machine_ready_time += instance->setup_flat(m, prev_job, curr_job);
             }
             time_info[curr_node].r_machine = machine_ready_time;
         }
@@ -94,7 +94,7 @@ void Schedule::update_time()
                 int m = graph.on_machine[ms];
                 int curr_job = (*operation_list)[op].job_id;
                 int next_job = (*operation_list)[ms].job_id;
-                next_machine_q += instance->sdst_matrix[m][curr_job][next_job];
+                next_machine_q += instance->setup_flat(m, curr_job, next_job);
             }
             time_info[op].q_machine = next_machine_q;
         }
@@ -103,6 +103,121 @@ void Schedule::update_time()
         time_info[op].backward_path_length = std::max(time_info[op].q_job, time_info[op].q_machine);
     }
 
+}
+
+// ======================================================================
+// 【P1】只算正向的 makespan 评估
+//
+// 与 update_time() 的前半段逻辑逐行一致，唯一区别是省掉了反向遍
+// （q_job / q_machine / backward_path_length 的计算）。
+//
+// 用途：top-K 探针。探针只调用 get_makespan()，不读任何 q_*，
+// 因此省掉反向遍不会改变 makespan 数值，也就不会改变搜索轨迹。
+//
+// 收益：update_time() 的三段工作量（拓扑 + 正向 + 反向）里，反向约占三分之一，
+//       而每代 9 次评估中有 8 次是探针 → 整体约 1.8~2x。
+// ======================================================================
+int Schedule::eval_makespan_only(const int abort_bound)
+{
+    const int n = graph.node_num;
+    time_info.resize(n);
+
+    // 复用成员缓冲区：稳态下零分配（原实现每次要新建 1 vector + 2 deque）
+    auto& indeg = fwd_indegree_;
+    auto& queue = fwd_queue_;
+    indeg.assign(n, 0);
+    queue.clear();
+    queue.reserve(n); // 只有首次（或扩容时）才真正分配
+
+    // 入度 = 尚未处理的前驱数。析取图中每个节点最多两个前驱（工件前驱 + 机器前驱）。
+    // 注：虚拟源点 0 的出边不计入入度，改为在弹出源点时单独解锁——与原有
+    // topological_sort 的语义逐条保持一致，保证拓扑顺序与原来完全相同。
+    for (int i = 0; i < n; ++i)
+    {
+        indeg[i] = static_cast<int>(graph.job_predecessor[i] != -1) +
+                   static_cast<int>(graph.machine_predecessor[i] != -1);
+    }
+
+    queue.push_back(0); // 虚拟源点
+    std::size_t head = 0;
+    int relaxed = 0; // 已松弛的实工序数，正常应达到 n-2
+    int new_makespan = 0;
+
+    while (head < queue.size())
+    {
+        const int curr = queue[head++];
+
+        if (curr == 0)
+        {
+            // 虚拟源点：解锁各工件的首工序
+            for (const int node : graph.first_job_operation)
+            {
+                if (--indeg[node] == 0) queue.push_back(node);
+            }
+            continue;
+        }
+
+        // 入度归零 ⟹ 两个前驱都已被松弛，可以就地算最长路。
+        // 这就是「Kahn 拓扑排序 + 最长路松弛」的融合点：省掉一次独立的全图遍历。
+        int r_job = 0;
+        const int prev_op_id = graph.job_predecessor[curr];
+        if (prev_op_id != -1) r_job = time_info[prev_op_id].end_time;
+
+        int r_machine = 0;
+        const int prev_machine_id = graph.machine_predecessor[curr];
+        if (prev_machine_id != -1)
+        {
+            int machine_ready_time = time_info[prev_machine_id].end_time;
+            if (instance != nullptr)
+            {
+                const int m = graph.on_machine[curr];
+                const int curr_job = (*operation_list)[curr].job_id;
+                const int prev_job = (*operation_list)[prev_machine_id].job_id;
+                machine_ready_time += instance->setup_flat(m, prev_job, curr_job);
+            }
+            r_machine = machine_ready_time;
+        }
+
+        auto& info = time_info[curr];
+        info.r_job = r_job;
+        info.r_machine = r_machine;
+        info.operator_id = curr;
+        info.forward_path_length = std::max(r_job, r_machine);
+
+        const int end_time = info.forward_path_length +
+                             (*operation_list)[curr][graph.on_machine[curr]];
+        info.end_time = end_time;
+
+        if (end_time > new_makespan)
+        {
+            new_makespan = end_time;
+            // 【P4】提前中止。只在「严格大于」时放弃——等于时照常算完，
+            // 这样平局时的取值顺序与原来一致，搜索轨迹不变。
+            if (new_makespan > abort_bound) return INT_MAX;
+        }
+
+        if (++relaxed == n - 2) break; // 实工序全部处理完；虚拟汇点 n-1 无需松弛
+
+        // 解锁后继
+        const int js = graph.job_successor[curr];
+        if (js != -1 && --indeg[js] == 0) queue.push_back(js);
+        const int ms = graph.machine_successor[curr];
+        if (ms != -1 && --indeg[ms] == 0) queue.push_back(ms);
+    }
+
+    // 有环：部分节点没能松弛，此时 new_makespan 不可信。
+    // 原实现靠 topological_sort 抛异常来发现成环，这里直接返回 INT_MAX，
+    // 对调用方而言等价于「该移动不可行/不更优」，且省掉了异常栈展开。
+    if (relaxed != n - 2) return INT_MAX;
+
+    makespan = new_makespan;
+    return new_makespan;
+}
+
+int Schedule::apply_and_eval_makespan(const NeighborhoodMove& move, const int abort_bound)
+{
+    graph.make_move(move);
+    return eval_makespan_only(abort_bound);
 }
 
 void Schedule::export_schedule(const char* filename) const

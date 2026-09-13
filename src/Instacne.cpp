@@ -67,6 +67,22 @@ std::istream &operator>>(std::istream &is, Instance &instance) {
             }
         }
     }
+    // 【P5】三层嵌套的 sdst_matrix 在热路径上每次查询要 3 次依赖式解引用，
+    // 这里在解析完成后摊平成一维，供 update_time / LB 估计使用。
+    // sdst_matrix 此后不再被修改，摊平结果始终有效。
+    instance.sdst_flat.resize(static_cast<std::size_t>(instance.machine_num) *
+                              instance.job_num * instance.job_num);
+    {
+        std::size_t k = 0;
+        for (int m = 0; m < instance.machine_num; ++m) {
+            for (int i = 0; i < instance.job_num; ++i) {
+                for (int j = 0; j < instance.job_num; ++j) {
+                    instance.sdst_flat[k++] = instance.sdst_matrix[m][i][j];
+                }
+            }
+        }
+    }
+
     // === 新增/修改部分结束 ===
     return is;
 }

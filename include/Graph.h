@@ -19,7 +19,9 @@
  */
 struct Graph
 {
-    int node_num;
+    // 必须给默认值：默认构造的 Graph（如 `Graph g;`）若未赋值就被读取，
+    // 这里会是未初始化的垃圾值，属于未定义行为。
+    int node_num{};
     std::vector<int> job_successor; // Successor in job sequence
     std::vector<int> machine_successor; // Successor in machine sequence
 
@@ -40,7 +42,8 @@ struct Graph
 
     std::vector<int> on_machine; // 操作在哪个机器上
     std::vector<int> machine_operation_count; // 每个机器上当前有几个操作
-    std::vector<int> on_machine_pos_vec; // 操作在哪个位置
+    // 【P9】原 on_machine_pos_vec 已删除：它在 make_move 里被 10 处写入、
+    // 每次换机器还要沿链表做 O(链长) 的整体位移，但全项目没有任何读取点。
 
     /**
      * Performs topological sort on the graph
@@ -62,9 +65,6 @@ struct Graph
 
     void make_move(const NeighborhoodMove& move);
 
-
-    [[maybe_unused]] [[deprecated("Please use on_machine_pos_vec[op_id] instead.")]] [[nodiscard]] int
-    on_machine_pos(int op_id) const;
 
 };
 
