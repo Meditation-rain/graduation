@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.31)
 project(MyProject)
 
+# 默认 Release：未显式指定 CMAKE_BUILD_TYPE 时防止落入无优化的 -O0
+# （-O0 会慢约 20 倍且不报错；显式传 -DCMAKE_BUILD_TYPE=Debug 等仍优先）
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
